@@ -17,6 +17,7 @@
 #include <fstream>
 #include <mutex>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <fmt/format.h>
@@ -541,10 +542,75 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
         }
     }
 }
+
+// EDEN_NX2_GPU_PROFILE only: counts draws per render target every 10 s and logs the busiest.
+void CountDrawForCensus(const Tegra::Engines::Maxwell3D& maxwell3d, bool indirect) {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    struct Key {
+        u64 zeta;
+        u64 color;
+        u32 zeta_size;
+        u32 color_size;
+        u32 color_count;
+        u32 topology;
+        bool indirect;
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash {
+        size_t operator()(const Key& k) const {
+            u64 h = k.zeta * 0x9E3779B97F4A7C15ULL;
+            h ^= k.color + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+            h ^= (u64{k.zeta_size} << 32 | k.color_size) + (h << 6) + (h >> 2);
+            h ^= (u64{k.color_count} << 8 | k.topology << 1 | (k.indirect ? 1 : 0)) + (h << 6);
+            return static_cast<size_t>(h);
+        }
+    };
+    static thread_local std::unordered_map<Key, u64, KeyHash> counts;
+    static thread_local u64 total{};
+    static thread_local auto window_start = std::chrono::steady_clock::now();
+
+    const auto& regs = maxwell3d.regs;
+    const bool has_zeta = regs.zeta_enable != 0;
+    Key key{};
+    key.zeta = has_zeta ? regs.zeta.Address() : 0;
+    key.zeta_size = has_zeta ? (regs.zeta_size.width << 16 | (regs.zeta_size.height & 0xffff)) : 0;
+    key.color_count = regs.rt_control.count.Value();
+    if (key.color_count > 0) {
+        key.color = regs.rt[0].Address();
+        key.color_size = regs.rt[0].width << 16 | (regs.rt[0].height & 0xffff);
+    }
+    key.topology = static_cast<u32>(maxwell3d.draw_manager.draw_state.topology);
+    key.indirect = indirect;
+    ++counts[key];
+    ++total;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window_start < std::chrono::seconds{10}) {
+        return;
+    }
+    std::vector<std::pair<Key, u64>> sorted(counts.begin(), counts.end());
+    std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second > b.second; });
+    LOG_INFO(HW_GPU, "Draw census (10 s): {} draws, {} distinct targets", total, sorted.size());
+    for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
+        const auto& [k, n] = sorted[i];
+        LOG_INFO(HW_GPU,
+                 "  census #{}: {} draws | zeta {:#x} {}x{} | color0 {:#x} {}x{} (count {}) | "
+                 "topology {} | {}",
+                 i + 1, n, k.zeta, k.zeta_size >> 16, k.zeta_size & 0xffff, k.color,
+                 k.color_size >> 16, k.color_size & 0xffff, k.color_count, k.topology,
+                 k.indirect ? "indirect" : "direct");
+    }
+    counts.clear();
+    total = 0;
+    window_start = now;
+}
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    CountDrawForCensus(*maxwell3d, false);
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
         // should have written. Past 16M vertices they are garbage: building the quad index
@@ -712,6 +778,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 
 void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    CountDrawForCensus(*maxwell3d, true);
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params] {
